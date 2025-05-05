@@ -1,8 +1,11 @@
 <?php
 
+use Dotenv\Dotenv;
+
 $params = require __DIR__ . '/params.php';
 $db = require __DIR__ . '/db.php';
-
+$dotenv = Dotenv::createImmutable(dirname(__DIR__), '.env.asterisk');
+$dotenv->safeLoad();
 $config = [
     'id' => 'basic-console',
     'basePath' => dirname(__DIR__),

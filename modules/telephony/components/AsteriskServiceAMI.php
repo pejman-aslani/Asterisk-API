@@ -1,6 +1,6 @@
 <?php
 
-namespace app\components;
+namespace app\modules\telephony\components;
 
 use Yii;
 
@@ -10,22 +10,17 @@ class AsteriskServiceAMI
     public function connect($host, $port, $username, $password)
     {
         try {
-            // تلاش برای اتصال به AMI
             $this->socket = fsockopen($host, $port, $errno, $errstr, 10);
-
             if (!$this->socket) {
-                // در صورت عدم اتصال
                 Yii::error("خطا در اتصال به AMI: $errstr ($errno)", 'live-calls');
                 return false;
             }
-            // ارسال اطلاعات ورود به AMI
             $login = "Action: Login\r\nUsername: $username\r\nSecret: $password\r\n\r\n";
             fwrite($this->socket, $login);
-            // خواندن جواب از AMI
             $response = fgets($this->socket);
             Yii::info('Response from AMI: ' . $response, 'live-calls');
             if (strpos($response, 'Authentication accepted') !== false) {
-                return true;  // اتصال برقرار است
+                return true;
             } else {
                 Yii::error("اطلاعات ورود اشتباه است: " . $response, 'live-calls');
                 return false;
@@ -35,9 +30,6 @@ class AsteriskServiceAMI
             return false;
         }
     }
-
-
-
     public function send($cmd)
     {
         fwrite($this->socket, $cmd);
@@ -69,7 +61,67 @@ class AsteriskServiceAMI
     {
         fclose($this->socket);
     }
+    private function parseAmiEvent($raw)
+    {
+        $lines = explode("\n", $raw);
+        $data = [];
 
+        foreach ($lines as $line) {
+            if (strpos($line, ':') !== false) {
+                [$key, $value] = explode(':', $line, 2);
+                $data[trim($key)] = trim($value);
+            }
+        }
+
+        return $data;
+    }
+    private function saveCdrToDatabase($cdr)
+    {
+        try {
+            Yii::$app->db->createCommand()->insert('tbl_call_logs', [
+                'call_id' => $cdr['UniqueID'] ?? '',
+                'direction' => (strpos(strtolower($cdr['Channel'] ?? ''), 'sip') !== false ? 'outbound' : 'inbound'),
+                'source' => $cdr['Source'] ?? '',
+                'destination' => $cdr['Destination'] ?? '',
+                'started_at' => $cdr['StartTime'] ?? date('Y-m-d H:i:s'),
+                'answered_at' => $cdr['AnswerTime'] ?? null,
+                'ended_at' => $cdr['EndTime'] ?? date('Y-m-d H:i:s'),
+                'duration' => $cdr['Duration'] ?? 0,
+                'billsec' => $cdr['BillableSeconds'] ?? 0,
+                'status' => strtolower($cdr['Disposition'] ?? 'no-answer'),
+                'channel' => $cdr['Channel'] ?? '',
+                'recording_url' => null,
+                'created_at' => date('Y-m-d H:i:s'),
+            ])->execute();
+
+            Yii::info("CDR saved for call_id: " . ($cdr['UniqueID'] ?? '-'), 'cdr');
+        } catch (\Throwable $e) {
+            Yii::error("خطا در ذخیره CDR: " . $e->getMessage(), 'cdr');
+        }
+    }
+
+    public function listenToCdrEvents()
+    {
+        if (!$this->socket) {
+            Yii::error('AMI connection not established.', 'cdr');
+            return;
+        }
+
+        stream_set_timeout($this->socket, 0, 300000); // non-blocking
+
+        while (!feof($this->socket)) {
+            $eventData = '';
+            while (($line = fgets($this->socket)) !== false) {
+                if (trim($line) === '') break;
+                $eventData .= $line;
+            }
+
+            if (stripos($eventData, "Event: Cdr") !== false) {
+                $parsed = $this->parseAmiEvent($eventData);
+                $this->saveCdrToDatabase($parsed);
+            }
+        }
+    }
 
 
     public function getActiveCalls()
