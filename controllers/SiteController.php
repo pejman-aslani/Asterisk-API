@@ -128,8 +128,8 @@ class SiteController extends Controller
     }
     public function actionAmiPing()
     {
-        $ami = new AsteriskServiceAMI();
-        $ami->connect('192.168.180.7', 2342, 'pejman', '1234');
+        $ami = new \app\modules\telephony\components\AsteriskServiceAMI();
+        $ami->connect('192.168.180.7', 2342, 'admin', '123');
     
         $ping = $ami->command('Ping');
         $queues = $ami->command('QueueSummary');

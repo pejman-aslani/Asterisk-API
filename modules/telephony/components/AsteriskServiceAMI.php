@@ -7,22 +7,49 @@ use Yii;
 class AsteriskServiceAMI
 {
     private $socket;
+    private $timeout = 10; // تایم‌اوت مثل کد قدیمی
+
+    /**
+     * Connect to Asterisk AMI.
+     *
+     * @param string $host
+     * @param int $port
+     * @param string $username
+     * @param string $password
+     * @return bool
+     */
     public function connect($host, $port, $username, $password)
     {
         try {
-            $this->socket = fsockopen($host, $port, $errno, $errstr, 10);
+            $this->socket = @fsockopen($host, $port, $errno, $errstr, $this->timeout);
             if (!$this->socket) {
                 Yii::error("خطا در اتصال به AMI: $errstr ($errno)", 'live-calls');
                 return false;
             }
+
+            // ارسال دستور Login
             $login = "Action: Login\r\nUsername: $username\r\nSecret: $password\r\n\r\n";
             fwrite($this->socket, $login);
+
+            // خواندن فقط یک خط از پاسخ (مثل کد قدیمی)
             $response = fgets($this->socket);
-            Yii::info('Response from AMI: ' . $response, 'live-calls');
+            Yii::info("Login Response: $response", 'live-calls');
+
+            // برای دیباگ، پاسخ کامل رو هم بخونیم
+            $fullResponse = $response;
+            while (!feof($this->socket)) {
+                $line = fgets($this->socket);
+                $fullResponse .= $line;
+                if (trim($line) === '') {
+                    break;
+                }
+            }
+            Yii::info("Full Response: $fullResponse", 'live-calls');
+
             if (strpos($response, 'Authentication accepted') !== false) {
                 return true;
             } else {
-                Yii::error("اطلاعات ورود اشتباه است: " . $response, 'live-calls');
+                Yii::error("اطلاعات ورود اشتباه است: $response", 'live-calls');
                 return false;
             }
         } catch (\Exception $e) {
@@ -30,40 +57,113 @@ class AsteriskServiceAMI
             return false;
         }
     }
+
+    /**
+     * Send a command to AMI.
+     *
+     * @param string $cmd
+     * @return bool
+     */
     public function send($cmd)
     {
+        if (!$this->isSocketActive()) {
+            Yii::error('Socket is not active', 'live-calls');
+            return false;
+        }
         fwrite($this->socket, $cmd);
+        return true;
     }
 
+    /**
+     * Read response from AMI.
+     *
+     * @return string
+     */
     public function read()
     {
+        if (!$this->isSocketActive()) {
+            Yii::error('Socket is not active', 'live-calls');
+            return '';
+        }
+
         $response = '';
-        while (!feof($this->socket)) {
+        $timeout = time() + $this->timeout;
+        while (!feof($this->socket) && time() < $timeout) {
             $line = fgets($this->socket);
+            if ($line === false) {
+                break;
+            }
             $response .= $line;
-            if (trim($line) === '') break;
+            if (trim($line) === '') {
+                break;
+            }
         }
         return $response;
     }
 
+    /**
+     * Execute an AMI command.
+     *
+     * @param string $action
+     * @param array $params
+     * @return string
+     */
     public function command($action, $params = [])
     {
-        $cmd = "Action: $action\r\n";
+        $actionId = uniqid('ami_');
+        $cmd = "Action: $action\r\nActionID: $actionId\r\n";
         foreach ($params as $key => $val) {
             $cmd .= "$key: $val\r\n";
         }
         $cmd .= "\r\n";
-        $this->send($cmd);
-        return $this->read();
+
+        if ($this->send($cmd)) {
+            $response = $this->read();
+            if (strpos($response, "ActionID: $actionId") === false) {
+                Yii::warning("Response ActionID mismatch for action: $action", 'live-calls');
+            }
+            return $response;
+        }
+        return '';
     }
 
+    /**
+     * Close the AMI connection.
+     */
     public function close()
     {
-        fclose($this->socket);
+        if ($this->isSocketActive()) {
+            fclose($this->socket);
+        }
     }
+
+    /**
+     * Destructor to ensure socket is closed.
+     */
+    public function __destruct()
+    {
+        $this->close();
+    }
+
+    /**
+     * Check if socket is active.
+     *
+     * @return bool
+     */
+    private function isSocketActive()
+    {
+        return is_resource($this->socket) && !feof($this->socket);
+    }
+
+    /**
+     * Parse AMI event data.
+     *
+     * @param string $raw
+     * @return array
+     */
     private function parseAmiEvent($raw)
     {
-        $lines = explode("\n", $raw);
+        $lines = explode("\n", trim($raw));
         $data = [];
 
         foreach ($lines as $line) {
@@ -75,6 +175,12 @@ class AsteriskServiceAMI
 
         return $data;
     }
+
+    /**
+     * Save CDR to database.
+     *
+     * @param array $cdr
+     */
     private function saveCdrToDatabase($cdr)
     {
         try {
@@ -100,19 +206,24 @@ class AsteriskServiceAMI
         }
     }
 
+    /**
+     * Listen to CDR events and save them to database.
+     */
     public function listenToCdrEvents()
     {
-        if (!$this->socket) {
+        if (!$this->isSocketActive()) {
             Yii::error('AMI connection not established.', 'cdr');
             return;
         }
 
-        stream_set_timeout($this->socket, 0, 300000); // non-blocking
+        stream_set_timeout($this->socket, 0, 300000); // Non-blocking
 
         while (!feof($this->socket)) {
             $eventData = '';
             while (($line = fgets($this->socket)) !== false) {
-                if (trim($line) === '') break;
+                if (trim($line) === '') {
+                    break;
+                }
                 $eventData .= $line;
             }
 
@@ -123,51 +234,48 @@ class AsteriskServiceAMI
         }
     }
 
-
+    /**
+     * Get active calls.
+     *
+     * @return array
+     */
     public function getActiveCalls()
     {
-        // ارسال دستور به Asterisk
         $response = $this->command('Core Show Channels concise');
-
-        // اگر خروجی خالی است، به معنی عدم وجود تماس‌هاست
         if (empty($response)) {
             Yii::info('هیچ تماسی در حال حاضر وجود ندارد.', 'live-calls');
             return [];
         }
 
-        // تفکیک خطوط برای دریافت هر تماس
         $lines = explode("\n", trim($response));
         $calls = [];
 
-        // پردازش هر خط
         foreach ($lines as $line) {
-            // جدا کردن اطلاعات هر تماس با استفاده از '!'
             $callDetails = explode('!', $line);
-
-            // در صورتی که اطلاعات به اندازه کافی باشند، آنها را پردازش می‌کنیم
             if (count($callDetails) >= 10) {
-                $call = [
-                    'channel' => $callDetails[0],  // کانال تماس
-                    'route' => $callDetails[1],    // مسیر تماس
-                    'extension' => $callDetails[2], // شماره تماس
-                    'status' => $callDetails[4],   // وضعیت تماس
-                    'callType' => $callDetails[5], // نوع تماس (Dial)
-                    'callID' => $callDetails[9]    // شناسه تماس
+                $calls[] = [
+                    'channel' => $callDetails[0],
+                    'route' => $callDetails[1],
+                    'extension' => $callDetails[2],
+                    'status' => $callDetails[4],
+                    'callType' => $callDetails[5],
+                    'callID' => $callDetails[9],
                 ];
-
-                // اضافه کردن تماس به آرایه
-                $calls[] = $call;
             }
         }
 
-        // برگرداندن اطلاعات تماس‌ها
         return $calls;
     }
 
+    /**
+     * Get SIP peers status.
+     *
+     * @return array
+     */
     public function getPeers()
     {
         $response = $this->command('SIP show peers');
-        $lines = explode("\n", $response);
+        $lines = explode("\n", trim($response));
         $peers = [];
 
         foreach ($lines as $line) {
@@ -175,25 +283,37 @@ class AsteriskServiceAMI
                 $peers[] = [
                     'peer' => $matches[1],
                     'ip' => $matches[2] ?? '',
-                    'status' => $matches[3]
+                    'status' => $matches[3],
                 ];
             }
         }
 
         return $peers;
     }
+
+    /**
+     * Originate a call.
+     *
+     * @param string $channel
+     * @param string $exten
+     * @param string $context
+     * @param int $priority
+     * @param string $callerId
+     * @param int $timeout
+     * @param array $variables
+     * @return string
+     */
     public function originateCall($channel, $exten, $context = 'default', $priority = 1, $callerId = 'ServerCall', $timeout = 30000, $variables = [])
     {
         $params = [
-            'Channel' => $channel,          // مثال: SIP/101
-            'Exten' => $exten,              // شماره مقصد (مثلاً 102 یا شماره موبایل)
+            'Channel' => $channel,
+            'Exten' => $exten,
             'Context' => $context,
             'Priority' => $priority,
             'CallerID' => $callerId,
             'Timeout' => $timeout,
         ];
 
-        // اگر متغیر خاصی بخواهیم ارسال کنیم
         if (!empty($variables)) {
             $vars = [];
             foreach ($variables as $key => $val) {
@@ -202,133 +322,214 @@ class AsteriskServiceAMI
             $params['Variable'] = implode('|', $vars);
         }
 
-        $response = $this->command('Originate', $params);
-        return $response;
+        return $this->command('Originate', $params);
     }
+
+    /**
+     * Hang up a channel.
+     *
+     * @param string $channel
+     * @return string
+     */
     public function hangupChannel($channel)
     {
-        $params = [
-            'Channel' => $channel
-        ];
-
-        $response = $this->command('Hangup', $params);
-        return $response;
+        return $this->command('Hangup', ['Channel' => $channel]);
     }
+
+    /**
+     * Get channel information.
+     *
+     * @param string $channel
+     * @return string
+     */
     public function getChannelInfo($channel)
     {
-        $params = ['Channel' => $channel];
-        $response = $this->command('ChannelStatus', $params);
-        return $response;
+        return $this->command('Status', ['Channel' => $channel]);
     }
 
+    /**
+     * Get queue status.
+     *
+     * @param string|null $queue
+     * @return string
+     */
     public function getQueueStatus($queue = null)
     {
-        $params = [];
-        if ($queue) {
-            $params['Queue'] = $queue;
-        }
-
-        $response = $this->command('QueueStatus', $params);
-        return $response;
+        $params = $queue ? ['Queue' => $queue] : [];
+        return $this->command('QueueStatus', $params);
     }
+
+    /**
+     * Get Asterisk core status.
+     *
+     * @return string
+     */
     public function getAsteriskInfo()
     {
         return $this->command('CoreStatus');
     }
+
+    /**
+     * Get list of conference bridge rooms.
+     *
+     * @return string
+     */
     public function getConfBridgeList()
     {
         return $this->command('ConfbridgeListRooms');
     }
-    public function playbackToChannel($channel, $soundFile)
-    {
-        $params = [
-            'Channel' => $channel,
-            'File' => $soundFile // مثل: "demo-congrats"
-        ];
 
-        return $this->command('PlayDTMF', $params);
-    }
+    /**
+     * Play DTMF to a channel.
+     *
+     * @param string $channel
+     * @param string $digit
+     * @return string
+     */
     public function sendDTMF($channel, $digit)
     {
-        $params = [
+        return $this->command('PlayDTMF', [
             'Channel' => $channel,
-            'Digit' => $digit
-        ];
-
-        return $this->command('PlayDTMF', $params);
+            'Digit' => $digit,
+        ]);
     }
+
+    /**
+     * Start monitoring a channel.
+     *
+     * @param string $channel
+     * @param string $file
+     * @param string $format
+     * @return string
+     */
     public function startMonitor($channel, $file, $format = 'wav')
     {
-        $params = [
+        return $this->command('Monitor', [
             'Channel' => $channel,
             'File' => $file,
             'Format' => $format,
-            'Mix' => '1' // میکس ورودی و خروجی
-        ];
-
-        return $this->command('Monitor', $params);
+            'Mix' => '1',
+        ]);
     }
+
+    /**
+     * Stop monitoring a channel.
+     *
+     * @param string $channel
+     * @return string
+     */
     public function stopMonitor($channel)
     {
-        $params = ['Channel' => $channel];
-        return $this->command('StopMonitor', $params);
+        return $this->command('StopMonitor', ['Channel' => $channel]);
     }
+
+    /**
+     * Send a SIP message.
+     *
+     * @param string $to
+     * @param string $from
+     * @param string $body
+     * @return string
+     */
     public function sendMessage($to, $from, $body)
     {
-        $params = [
+        return $this->command('MessageSend', [
             'To' => "sip:$to",
             'From' => "sip:$from",
-            'Body' => $body
-        ];
-
-        return $this->command('MessageSend', $params);
+            'Body' => $body,
+        ]);
     }
+
+    /**
+     * Get trunks status.
+     *
+     * @return array
+     */
     public function getTrunksStatus()
     {
         $sipTrunks = $this->command('SIP show registry');
         $iaxTrunks = $this->command('IAX2 show registry');
-
         return [
             'sip' => $sipTrunks,
-            'iax' => $iaxTrunks
+            'iax' => $iaxTrunks,
         ];
     }
+
+    /**
+     * Hang up a channel with a specific cause.
+     *
+     * @param string $channel
+     * @param int $cause
+     * @return string
+     */
     public function hangupWithCause($channel, $cause)
     {
-        $params = [
+        return $this->command('Hangup', [
             'Channel' => $channel,
-            'Cause' => $cause // مثلاً 16 برای “normal clearing”
-        ];
-
-        return $this->command('Hangup', $params);
+            'Cause' => $cause,
+        ]);
     }
+
+    /**
+     * Redirect a call.
+     *
+     * @param string $channel
+     * @param string $context
+     * @param string $exten
+     * @param int $priority
+     * @return string
+     */
     public function redirectCall($channel, $context, $exten, $priority = 1)
     {
-        $params = [
+        return $this->command('Redirect', [
             'Channel' => $channel,
             'Context' => $context,
             'Exten' => $exten,
-            'Priority' => $priority
-        ];
-
-        return $this->command('Redirect', $params);
+            'Priority' => $priority,
+        ]);
     }
+
+    /**
+     * Get CDR status.
+     *
+     * @return string
+     */
     public function getCDRList()
     {
         return $this->command('Command', ['Command' => 'cdr show status']);
     }
+
+    /**
+     * Log a message to Asterisk console.
+     *
+     * @param string $level
+     * @param string $message
+     * @return string
+     */
     public function logToAsteriskConsole($level, $message)
     {
         return $this->command('Command', [
-            'Command' => "logger log $level \"$message\""
+            'Command' => "logger log $level \"$message\"",
         ]);
     }
+
+    /**
+     * Get recent call history.
+     *
+     * @param int $limit
+     * @return string
+     */
     public function getCallHistory($limit = 50)
     {
-        $cmd = "Command: cdr show last $limit\r\n";
-        $this->send($cmd);
-        return $this->read();
+        return $this->command('Command', ['Command' => "cdr show last $limit"]);
     }
+
+    /**
+     * Find an active call by phone number.
+     *
+     * @param string $phoneNumber
+     * @return array|null
+     */
     public function findActiveCallByNumber($phoneNumber)
     {
         $calls = $this->getActiveCalls();
@@ -339,32 +540,80 @@ class AsteriskServiceAMI
         }
         return null;
     }
+
+    /**
+     * Get agent status.
+     *
+     * @param string $agentChannel
+     * @return string
+     */
     public function getAgentStatus($agentChannel)
     {
         return $this->command('QueueMemberStatus', ['Interface' => $agentChannel]);
     }
+
+    /**
+     * Count active calls.
+     *
+     * @return int
+     */
     public function countActiveCalls()
     {
-        $calls = $this->getActiveCalls();
-        return count($calls);
+        return count($this->getActiveCalls());
     }
+
+    /**
+     * Direct a call to an agent.
+     *
+     * @param string $customerNumber
+     * @param string $agentExtension
+     * @return string
+     */
     public function directCallToAgent($customerNumber, $agentExtension)
     {
         $channel = "SIP/$agentExtension";
-        return $this->originateCall($channel, $customerNumber, 'from-internal', 1, "AgentCall");
+        return $this->originateCall($channel, $customerNumber, 'from-internal', 1, 'AgentCall');
     }
+
+    /**
+     * Notify an agent with a message.
+     *
+     * @param string $agentExtension
+     * @param string $message
+     * @return string
+     */
     public function notifyAgent($agentExtension, $message)
     {
         return $this->sendMessage($agentExtension, 'CRM', $message);
     }
+
+    /**
+     * Get queue summary.
+     *
+     * @return string
+     */
     public function getQueueSummary()
     {
         return $this->command('QueueSummary');
     }
+
+    /**
+     * Get calls in a specific queue.
+     *
+     * @param string $queue
+     * @return string
+     */
     public function getCallsInQueue($queue)
     {
         return $this->command('QueueStatus', ['Queue' => $queue]);
     }
+
+    /**
+     * Check if a customer is in a call.
+     *
+     * @param string $phoneNumber
+     * @return bool
+     */
     public function isCustomerInCall($phoneNumber)
     {
         $calls = $this->getActiveCalls();
@@ -375,6 +624,13 @@ class AsteriskServiceAMI
         }
         return false;
     }
+
+    /**
+     * Get active calls for a customer.
+     *
+     * @param string $phoneNumber
+     * @return array
+     */
     public function getCustomerActiveCalls($phoneNumber)
     {
         $calls = $this->getActiveCalls();
@@ -382,62 +638,130 @@ class AsteriskServiceAMI
             return strpos($call['extension'], $phoneNumber) !== false;
         });
     }
+
+    /**
+     * Get waiting calls in a queue.
+     *
+     * @param string $queue
+     * @return string
+     */
     public function getWaitingCallsInQueue($queue)
     {
-        $status = $this->getQueueStatus($queue);
-        // پردازش خروجی با توجه به فرمت CLI
-        return $status; // در صورت نیاز می‌تونیم پردازش کنیم
+        return $this->getQueueStatus($queue);
     }
+
+    /**
+     * Get queue members.
+     *
+     * @param string $queue
+     * @return string
+     */
     public function getQueueMembers($queue)
     {
         return $this->command('Command', ['Command' => "queue show $queue"]);
     }
+
+    /**
+     * Add a member to a queue.
+     *
+     * @param string $queue
+     * @param string $interface
+     * @param int $penalty
+     * @return string
+     */
     public function addMemberToQueue($queue, $interface, $penalty = 0)
     {
         return $this->command('QueueAdd', [
             'Queue' => $queue,
             'Interface' => $interface,
-            'Penalty' => $penalty
+            'Penalty' => $penalty,
         ]);
     }
+
+    /**
+     * Remove a member from a queue.
+     *
+     * @param string $queue
+     * @param string $interface
+     * @return string
+     */
     public function removeMemberFromQueue($queue, $interface)
     {
         return $this->command('QueueRemove', [
             'Queue' => $queue,
-            'Interface' => $interface
+            'Interface' => $interface,
         ]);
     }
+
+    /**
+     * Set penalty for a queue member.
+     *
+     * @param string $queue
+     * @param string $interface
+     * @param int $penalty
+     * @return string
+     */
     public function setPenaltyForMember($queue, $interface, $penalty)
     {
         return $this->command('QueuePenalty', [
             'Queue' => $queue,
             'Interface' => $interface,
-            'Penalty' => $penalty
+            'Penalty' => $penalty,
         ]);
     }
+
+    /**
+     * Pause a queue member.
+     *
+     * @param string $interface
+     * @param string $reason
+     * @return string
+     */
     public function pauseQueueMember($interface, $reason = 'Break')
     {
         return $this->command('QueuePause', [
             'Interface' => $interface,
             'Paused' => 'true',
-            'Reason' => $reason
+            'Reason' => $reason,
         ]);
     }
+
+    /**
+     * Unpause a queue member.
+     *
+     * @param string $interface
+     * @return string
+     */
     public function unpauseQueueMember($interface)
     {
         return $this->command('QueuePause', [
             'Interface' => $interface,
-            'Paused' => 'false'
+            'Paused' => 'false',
         ]);
     }
+
+    /**
+     * Check if a queue member is paused.
+     *
+     * @param string $queue
+     * @param string $interface
+     * @return bool
+     */
     public function isQueueMemberPaused($queue, $interface)
     {
         $output = $this->getQueueMembers($queue);
-        return (strpos($output, "$interface (paused)") !== false);
+        return strpos($output, "$interface (paused)") !== false;
     }
+
+    /**
+     * Get queues a member is part of.
+     *
+     * @param string $interface
+     * @return array
+     */
     public function getQueuesOfMember($interface)
     {
-        $queues = ['sales', 'support', 'billing']; // در صورت نیاز داینامیک کن
+        $queues = ['sales', 'support', 'billing']; // TODO: Make dynamic
         $result = [];
 
         foreach ($queues as $queue) {
@@ -449,10 +773,14 @@ class AsteriskServiceAMI
 
         return $result;
     }
+
+    /**
+     * List all queues.
+     *
+     * @return string
+     */
     public function listQueues()
     {
-        $output = $this->command('Command', ['Command' => 'queue show']);
-        // می‌تونی خروجی رو با regex پردازش کنی و نام صف‌ها رو استخراج کنی
-        return $output;
+        return $this->command('Command', ['Command' => 'queue show']);
     }
 }

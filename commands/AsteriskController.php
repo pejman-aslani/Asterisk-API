@@ -5,9 +5,33 @@ namespace app\commands;
 use yii\console\Controller;
 use yii\console\ExitCode;
 use app\modules\telephony\components\AsteriskServiceAMI;
+use yii\filters\AccessControl;
+use yii\filters\VerbFilter;
 
 class AsteriskController extends Controller
 {
+    public function behaviors()
+    {
+        return [
+            'access' => [
+                'class' => AccessControl::class,
+                'only' => ['logout'],
+                'rules' => [
+                    [
+                        'actions' => ['logout'],
+                        'allow' => true,
+                        'roles' => ['@'],
+                    ],
+                ],
+            ],
+            'verbs' => [
+                'class' => VerbFilter::class,
+                'actions' => [
+                    'logout' => ['post'],
+                ],
+            ],
+        ];
+    }
     protected $asteriskService;
 
     public function __construct($id, $module, AsteriskServiceAMI $asteriskService, $config = [])
@@ -29,14 +53,10 @@ class AsteriskController extends Controller
             if (empty($host) || empty($port) || empty($username) || empty($password)) {
                 throw new \RuntimeException('Missing one or more required Asterisk AMI configuration parameters');
             }
+            $this->asteriskService->connect($host, $port, $username, $password);
+//            $this->stdout("Successfully connected to AMI...\n");
+            $this->asteriskService->listenToCdrEvents();
 
-            if ($this->asteriskService->connect($host, $port, $username, $password)) {
-                $this->stdout("Successfully connected to AMI...\n");
-                $this->asteriskService->listenToCdrEvents();
-            } else {
-                $this->stderr("Failed to connect to AMI. Check your credentials and connection settings.\n");
-                return ExitCode::UNSPECIFIED_ERROR;
-            }
 
             return ExitCode::OK;
         } catch (\Exception $e) {
